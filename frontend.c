@@ -30,23 +30,27 @@ fib(40)
 
 /* Enum of data types */
 enum Token {
-  KSOBJ_TYPE_EOF /*Indicate that inputs is finished, so stop the parser*/,
+  KSOBJ_TYPE_EOF, /*Indicate that inputs is finished, so stop the parser*/
   /*Commands*/
   KSOBJ_TYPE_DEF, /*Maps the function definition*/
   KSOBJ_TYPE_EXTERN , /* Declare an external function*/
   KSOBJ_TYPE_IDENTIFIER, /* Declare a functin or variable name*/
   KSOBJ_TYPE_NUMBER, /* Define double number*/
   KSOBJ_TYPE_OPERATOR, /* Define symbols */
-  KSOBJ_TYPE_BUF 
+  KSOBJ_TYPE_BUF,
+  KSOBJ_TYPE_LPAREN,
+  KSOBJ_TYPE_RPAREN,
+  KSOBJ_TYPE_COMMA
 };
 
 typedef enum {
   AST_NUMBER,
   AST_VARIABLE,
   AST_BINARY,
-  AST_CALL,
-  AST_PROTOTYPE,
-  AST_FUNCTION
+  AST_CALL, /* Calling the prototype*/
+  AST_PROTOTYPE, /* Definition of function, like sign of methods, it's contains, name of formal parameters, like 'x' or 'y' */
+  AST_FUNCTION,
+  AST_BUF
 }ASTNodeType;
 
 /* ----------------------------------------------- DATA TYPE ------------------------------------------------- */
@@ -76,6 +80,7 @@ typedef struct {
   char *p; 
 }kstoknizer;
 
+/* AST_OBJ */
 typedef struct ASTNode{
   int type;
   int refcount;
@@ -92,6 +97,11 @@ typedef struct ASTNode{
       struct ASTNode *rsh;
     }binary;
 
+    struct {
+      char *name;
+      struct ASTNode **args;
+      size_t arg_count;
+    }call;
   };
 }ASTNode;
 
@@ -103,7 +113,7 @@ typedef struct ksctx{
 
 /* ------------------------------------------------ FUNCTION PROTOTIPES -------------------------------------------- */
 ksobj *listGetBy(ksobj *l, int pos);
-
+ASTNode *parseExpression(ksctx *ctx);
 /* ------------------------------------------------- WRAPPER FUNCTION ---------------------------------------------- */
 void *safeRealloc(void *ptr, size_t size){
 
@@ -117,6 +127,7 @@ void *safeRealloc(void *ptr, size_t size){
 
 #define safeMalloc(size) safeRealloc(NULL, size);
 #define listCurr(list) listGetBy(list, -1);
+
 /* --------------------------------------------- OBJECT CREATION FUINCTION ------------------------------------------ */
 ksobj *createObject(int type){
   ksobj *o = safeMalloc(sizeof(*o));
@@ -168,6 +179,9 @@ void printObj(ksobj *o){
   case KSOBJ_TYPE_EXTERN:
   case KSOBJ_TYPE_DEF:
   case KSOBJ_TYPE_OPERATOR:
+  case KSOBJ_TYPE_LPAREN:
+  case KSOBJ_TYPE_RPAREN:
+  case KSOBJ_TYPE_COMMA:
     printf("%s", o->str.ptr);
     break;
   case KSOBJ_TYPE_BUF:
@@ -185,13 +199,15 @@ void printObj(ksobj *o){
 }
 
 void printAST(ASTNode *abs){
-  switch (abs->type){
 
+  if (!abs) return ;
+  switch (abs->type){
   case AST_NUMBER:
-    printf("%f ", abs->number);
+    printf("%f", abs->number);
     break;
+  case AST_FUNCTION:
   case AST_VARIABLE:
-    printf("%s ", abs->str.s);
+    printf("%s", abs->str.s);
     break;
   case AST_BINARY:{
     ASTNode *temp = abs;
@@ -200,11 +216,18 @@ void printAST(ASTNode *abs){
     printf(" %c ", abs->binary.op);
     printAST(temp->binary.rsh);
     printf(")");
-    
     break;
-    printf("\n");
   }
-
+  case AST_CALL:
+    printf("%s(", abs->call.name);
+    for(size_t j =0; j<abs->call.arg_count; j++){
+      ASTNode *arg = abs->call.args[j];
+      printAST(arg);
+      if (j + 1 < abs->call.arg_count)
+	printf(", ");
+    }
+    printf(")\n");
+    break;
   default:
     printf("?\n");
     break;
@@ -250,8 +273,8 @@ ASTNode *createBynaryNode(char op, struct ASTNode *left, struct ASTNode *right){
   return o;
 }
 
-/* For variable and function name */
-ASTNode *createIdentifierNode(char *s, size_t len){
+/* For variable  name */
+ASTNode *createVariableNode(char *s, size_t len){
   ASTNode *o = createNode(AST_VARIABLE);
   o->str.s = safeMalloc(len + 1);
   o->str.len = len;
@@ -260,6 +283,23 @@ ASTNode *createIdentifierNode(char *s, size_t len){
   return o;
 }
 
+ASTNode *createFunctionNode(char *s, size_t len){
+  ASTNode *o = createNode(AST_FUNCTION);
+  o->str.s = safeMalloc(len + 1);
+  o->str.len = len;
+  memcpy(o->str.s, s, len);
+  o->str.s[len] = 0;
+  return o;
+}
+
+/* Create a list node*/
+ASTNode *createCallNode(void){
+  ASTNode *o = createNode(AST_CALL);
+  o->call.name = NULL;
+  o->call.arg_count = 0;
+  o->call.args = NULL;
+  return o;
+}
 
 /* -------------------------------------------- LIST OBJECT FUNCTIONS -------------------------------------------------*/
 void listPush(ksobj *l, ksobj *o){
@@ -296,6 +336,12 @@ ksobj *listGetBy(ksobj *l, int pos){
   
 }
 
+void listPushAST(ASTNode *l, ASTNode *o){
+  l->call.args = safeRealloc(l->call.args, sizeof(*l) * (l->call.arg_count+1)); 
+  l->call.args[l->call.arg_count] = o;
+  l->call.arg_count++;
+ }
+
 int getMatchPrecedance(char op){
   switch (op){
     case('+'): return 10;
@@ -312,6 +358,60 @@ ASTNode *parseNumber(ksctx *ctx){
   return createNumberNode(tok->i);
 }
 
+/* Parse: variable, call and prototype */
+ASTNode *parseIdentifierExpr(ksctx *ctx){
+   ksobj *tok = listGetBy(ctx->stack, ctx->pos);
+   if (!tok) return NULL;
+   
+   ctx->pos++; /* Consume identifier */
+
+   ksobj *next =  listGetBy(ctx->stack, ctx->pos);
+   /* Case of variable */
+   if (!next || next->type != KSOBJ_TYPE_LPAREN)
+       return createVariableNode(tok->str.ptr, tok->str.len);
+
+   /* Case of call function */
+   /* Parse arguments */
+   
+   ctx->pos++; /* Consume '('*/
+   ASTNode *callList = createCallNode();
+   
+   while(1){
+     ksobj *curr = listGetBy(ctx->stack, ctx->pos);
+
+     if (!curr){
+       fprintf(stderr, "EOF \n");
+       return NULL;
+     } 
+     
+     if (curr->type == KSOBJ_TYPE_LPAREN) break; /* Case '()'*/
+   
+
+     ASTNode *arg = parseExpression(ctx);
+     listPushAST(callList, arg);
+     
+     curr = listGetBy(ctx->stack, ctx->pos);
+     
+     if (curr->type == KSOBJ_TYPE_COMMA){
+       ctx->pos++;
+       continue;
+     }
+     
+     if (curr->type ==  KSOBJ_TYPE_RPAREN) break;
+     
+     fprintf(stderr, "Expected: ',' or ')'\n");
+     return NULL; 
+   }
+   
+   ctx->pos++; /* Consume ')'*/
+   
+   callList->call.name = strdup(tok->str.ptr);
+
+   return callList;
+   
+}
+
+
 ASTNode *parsePrimary(ksctx *ctx){
   ksobj *tok = listGetBy(ctx->stack, ctx->pos); /* At the beginning get back the '0' position*/
 
@@ -323,11 +423,24 @@ ASTNode *parsePrimary(ksctx *ctx){
   if (tok->type == KSOBJ_TYPE_NUMBER)
     return parseNumber(ctx);
 
-  /* Variable case */
-
-  if (tok->type ==  KSOBJ_TYPE_IDENTIFIER){
+  /* Check parentesis */
+  if (tok->type == KSOBJ_TYPE_LPAREN){
     ctx->pos++;
-    return createIdentifierNode(tok->str.ptr, tok->str.len);
+
+    ASTNode *expr = parseExpression(ctx);
+    
+    ksobj *close = listGetBy(ctx->stack, ctx->pos);
+    if (!close || close->type !=  KSOBJ_TYPE_RPAREN){
+      fprintf(stderr, "Erorr: axpected ')'\n");
+      return NULL;
+    }
+    ctx->pos++; /* Consume ')' */
+    return expr;
+  }
+  
+  /* Variable case or call function */
+  if (tok->type ==  KSOBJ_TYPE_IDENTIFIER){
+    return parseIdentifierExpr(ctx);
   }
   
   fprintf(stderr, "Errror: parse primary! \n");
@@ -405,11 +518,11 @@ ksobj *parseIdentifier(kstoknizer *tok){
 
   /* Check functions */
   if (len == 3 && (strncmp(start, "def", len)) == 0)
-    return createSymbolObj(start, len,  KSOBJ_TYPE_OPERATOR);
+    return createSymbolObj(start, len,   KSOBJ_TYPE_DEF);
   if (len == 6 && (strncmp(start, "extern", len)) == 0)
     return createSymbolObj(start, len, KSOBJ_TYPE_EXTERN);
 
-  /* Otherwise is a normal identifier, like varniable*/
+  /* Otherwise is a normal identifier, like variable */
   return createSymbolObj(start, len, KSOBJ_TYPE_IDENTIFIER);
 }
 
@@ -440,6 +553,15 @@ ksobj *compile(char *prgtext){
     }else if (strchr("#", tokenizer.p[0])) {
       parseComments(&tokenizer);
       continue;
+    }else if (strchr("(", tokenizer.p[0])){
+      o = createSymbolObj("(", 1, KSOBJ_TYPE_LPAREN);
+      tokenizer.p++;
+    }else if (strchr(")", tokenizer.p[0])){
+      o = createSymbolObj(")", 1, KSOBJ_TYPE_RPAREN);
+      tokenizer.p++;
+    }else if  (strchr(",", tokenizer.p[0])){
+      o = createSymbolObj(",", 1, KSOBJ_TYPE_COMMA);
+      tokenizer.p++;
     }else{
       o = NULL;
     }
@@ -522,7 +644,7 @@ int main(int argc, char **argv){
   ksctx *ctx = createContext();
   exec(ctx, prg);
 
-  printObj(ctx->stack);
+  //printObj(ctx->stack);
 
   printAST(ctx->AST);
   
